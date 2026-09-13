@@ -4,16 +4,25 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class AuthUser(val id: String, val email: String? = null)
+data class AuthUser(
+    val id: String,
+    val email: String? = null
+)
 
 @Serializable
 data class AuthResponse(
     @SerialName("access_token") val accessToken: String? = null,
     @SerialName("refresh_token") val refreshToken: String? = null,
+    @SerialName("expires_in") val expiresIn: Long? = null,
     val user: AuthUser? = null
 )
 
-data class Session(val accessToken: String, val refreshToken: String?, val userId: String)
+data class Session(
+    val accessToken: String,
+    val refreshToken: String?,
+    val userId: String,
+    val expiresAtEpochSeconds: Long = 0L
+)
 
 @Serializable
 data class Profile(
@@ -21,6 +30,7 @@ data class Profile(
     val handle: String,
     @SerialName("hpke_public_keyset") val hpkePublicKeyset: String,
     @SerialName("signing_public_key") val signingPublicKey: String,
+    @SerialName("created_at") val createdAt: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null
 )
 
@@ -34,6 +44,8 @@ data class DbMessage(
     @SerialName("ciphertext_to_sender") val ciphertextToSender: String,
     val signature: String,
     @SerialName("file_path") val filePath: String? = null,
+    @SerialName("delivered_at") val deliveredAt: String? = null,
+    @SerialName("read_at") val readAt: String? = null,
     @SerialName("created_at") val createdAt: String? = null
 )
 
@@ -44,7 +56,9 @@ data class MessagePayload(
     val fileName: String? = null,
     val mimeType: String? = null,
     val fileSize: Long? = null,
-    val fileKeyset: String? = null
+    val fileKeyset: String? = null,
+    val replyToId: String? = null,
+    val replyPreview: String? = null
 )
 
 data class DecryptedMessage(
@@ -53,9 +67,31 @@ data class DecryptedMessage(
     val body: String,
     val fromMe: Boolean,
     val securityBlocked: Boolean = false
+) {
+    val deliveryLabel: String
+        get() = when {
+            !fromMe -> ""
+            db.readAt != null -> "Read"
+            db.deliveredAt != null -> "Delivered"
+            else -> "Sent"
+        }
+}
+
+data class Conversation(
+    val contact: Profile,
+    val lastMessage: DecryptedMessage?,
+    val lastAt: String?,
+    val unreadCount: Int
 )
 
 data class EncryptedAttachment(
     val ciphertext: ByteArray,
     val keysetJson: String
+)
+
+@Serializable
+data class BlockRow(
+    @SerialName("owner_id") val ownerId: String,
+    @SerialName("blocked_id") val blockedId: String,
+    @SerialName("created_at") val createdAt: String? = null
 )

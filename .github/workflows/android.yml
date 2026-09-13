@@ -30,20 +30,20 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Cache debug keystore
+      - name: Cache debug signing key
         uses: actions/cache@v4
         with:
           path: ~/.android/debug.keystore
           key: minichat-debug-keystore-v1
 
-      - name: Build debug APK
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-        run: gradle --no-daemon :app:assembleDebug
+      - name: Lint and build APK
+        run: gradle --no-daemon :app:lintDebug :app:assembleDebug
+
+      - name: APK checksum
+        run: sha256sum app/build/outputs/apk/debug/app-debug.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: minichat-debug-apk
+          name: minichat-v1-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
