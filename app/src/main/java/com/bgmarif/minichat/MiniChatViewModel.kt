@@ -25,6 +25,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val api = SupabaseApi(BuildConfig.SUPABASE_URL, BuildConfig.SUPABASE_ANON_KEY)
     private val crypto = CryptoEngine(app)
+    private val cache = LocalCache(app)
     private val json = Json { ignoreUnknownKeys = true }
     private val sessionPrefs = app.getSharedPreferences("session_v2", Context.MODE_PRIVATE)
     private val localPrefs = app.getSharedPreferences("local_ui_v1", Context.MODE_PRIVATE)
@@ -61,28 +62,71 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
         bootstrap()
     }
 
-    private fun bootstrap() = viewModelScope.launch {
-        val loaded = session ?: return@launch
-        busy = true
-        status = "Opening secure session…"
+    /**
+     * Hydrate from app-private SQLite first so the UI can paint immediately, then sync.
+     */
+    private fun bootstrap() {
+        val loaded = session ?: return
         runCatching {
-            val fresh = ensureFreshSession(loaded)
-            val profile = api.profileByUserId(fresh.accessToken, fresh.userId)
-            ownProfile = profile
-            needsHandle = profile == null
-            if (profile != null) {
-                publishCurrentKeys(profile.handle)
-                refreshBlockedInternal(fresh)
-                refreshConversationsInternal(fresh)
-                status = ""
-            } else {
-                status = "Choose a MiniChat handle to finish setup"
-            }
+            activateAccount(loaded.userId)
+            hydrateCachedState(loaded.userId)
         }.onFailure {
             clearSession()
-            status = "Session expired. Sign in again."
+            status = "Local security state could not be opened. Sign in again."
+            return
         }
-        busy = false
+
+        viewModelScope.launch {
+            busy = conversations.isEmpty() && ownProfile == null
+            if (busy) status = "Opening secure session…"
+            runCatching {
+                val fresh = ensureFreshSession(loaded)
+                val profile = api.profileByUserId(fresh.accessToken, fresh.userId)
+                ownProfile = profile
+                needsHandle = profile == null
+                if (profile != null) {
+                    cache.upsertProfiles(listOf(profile))
+                    publishCurrentKeys(profile.handle, fresh)
+                    refreshBlockedInternal(fresh)
+                    refreshConversationsInternal(fresh)
+                    status = ""
+                } else {
+                    status = "Choose a MiniChat handle to finish setup"
+                }
+            }.onFailure {
+                // Local data remains available until the user explicitly logs out.
+                status = if (conversations.isNotEmpty() || ownProfile != null) {
+                    "Offline or sync unavailable — showing local data"
+                } else {
+                    friendlyError(it)
+                }
+            }
+            busy = false
+        }
+    }
+
+    private fun activateAccount(userId: String) {
+        crypto.activateUser(userId)
+        val pendingHandle = localPrefs.getString("pending_handle", null)
+        val changedAccount = cache.prepareForAccount(userId)
+        if (changedAccount) {
+            // Never carry per-login UI state or decrypted temp files across accounts.
+            localPrefs.edit().clear().apply()
+            runCatching {
+                File(getApplication<Application>().cacheDir, "decrypted").deleteRecursively()
+            }
+            if (!pendingHandle.isNullOrBlank()) {
+                localPrefs.edit().putString("pending_handle", pendingHandle).apply()
+            }
+        }
+    }
+
+    private fun hydrateCachedState(userId: String) {
+        ownProfile = cache.loadProfile(userId)
+        blockedIds = cache.loadBlockedIds()
+        val rows = cache.loadInboxRows(userId).filterNot { it.id in hiddenIds() }
+        val profiles = cache.loadProfiles().associateBy { it.userId }
+        conversations = buildConversations(rows, profiles, userId)
     }
 
     private fun loadSession(): Session? {
@@ -108,6 +152,12 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun clearSession() {
         sessionPrefs.edit().clear().apply()
+        cache.wipe()
+        localPrefs.edit().clear().apply()
+        runCatching {
+            File(getApplication<Application>().cacheDir, "decrypted").deleteRecursively()
+        }
+        crypto.deactivate()
         session = null
         ownProfile = null
         needsHandle = false
@@ -133,7 +183,10 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectTab(value: Tab) {
         tab = value
-        if (value == Tab.CHATS) refreshConversations()
+        if (value == Tab.CHATS) {
+            session?.userId?.let(::hydrateCachedState)
+            refreshConversations()
+        }
         if (value == Tab.SETTINGS) refreshBlockedProfiles()
     }
 
@@ -155,6 +208,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             if (created == null) {
                 status = "Account created. Confirm the email, then sign in. Your @$cleanHandle handle is saved on this phone."
             } else {
+                activateAccount(created.userId)
                 saveSession(created)
                 finishProfile(created, cleanHandle)
                 status = "Welcome to MiniChat"
@@ -168,10 +222,13 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
         status = "Signing in…"
         runCatching {
             val loggedIn = api.login(email.trim(), password)
+            activateAccount(loggedIn.userId)
             saveSession(loggedIn)
+            hydrateCachedState(loggedIn.userId)
             val existing = api.profileByUserId(loggedIn.accessToken, loggedIn.userId)
             if (existing != null) {
                 ownProfile = existing
+                cache.upsertProfiles(listOf(existing))
                 needsHandle = false
                 publishCurrentKeys(existing.handle)
                 localPrefs.edit().remove("pending_handle").apply()
@@ -233,6 +290,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             updatedAt = Instant.now().toString()
         )
         api.upsertProfile(s.accessToken, profile)
+        cache.upsertProfiles(listOf(profile))
         ownProfile = profile
     }
 
@@ -279,6 +337,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             val s = ensureFreshSession()
             peopleResults = api.searchProfiles(s.accessToken, query)
                 .filter { it.userId != s.userId && it.userId !in blockedIds }
+            cache.upsertProfiles(peopleResults)
             status = ""
         }.onFailure { status = friendlyError(it) }
     }
@@ -288,8 +347,13 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             status = "Unblock @${profile.handle} before chatting"
             return
         }
-        contact = profile
-        messages = emptyList()
+        val s = session ?: return
+        cache.upsertProfiles(listOf(profile))
+        contact = cache.loadProfile(profile.userId) ?: profile
+        // Instant path: render local ciphertext after on-device decrypt, no network wait.
+        messages = cache.loadThread(s.userId, profile.userId)
+            .filterNot { it.id in hiddenIds() }
+            .map { decryptRow(it, contact ?: profile) }
         replyingTo = null
         status = ""
         refreshMessages()
@@ -300,6 +364,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
         messages = emptyList()
         replyingTo = null
         status = ""
+        session?.userId?.let(::hydrateCachedState)
         refreshConversations()
     }
 
@@ -311,6 +376,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
         val hidden = hiddenIds().toMutableSet()
         hidden += messageId
         localPrefs.edit().putStringSet("hidden_messages", hidden).apply()
+        cache.deleteMessage(messageId)
         messages = messages.filterNot { it.db.id == messageId }
     }
 
@@ -325,23 +391,40 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun refreshConversationsInternal(s: Session) {
-        val rows = api.fetchInboxRows(s.accessToken, s.userId)
+        var rows = api.fetchInboxRows(s.accessToken, s.userId)
             .filterNot { it.id in hiddenIds() }
         val incomingUndelivered = rows.filter {
             it.recipientId == s.userId && it.deliveredAt == null
-        }.map { it.id }
+        }.map { it.id }.toSet()
         if (incomingUndelivered.isNotEmpty()) {
-            runCatching { api.markDelivered(s.accessToken, s.userId, incomingUndelivered) }
+            runCatching { api.markDelivered(s.accessToken, s.userId, incomingUndelivered.toList()) }
+            val now = Instant.now().toString()
+            rows = rows.map { row ->
+                if (row.id in incomingUndelivered) row.copy(deliveredAt = now) else row
+            }
         }
 
         val otherIds = rows.map {
             if (it.senderId == s.userId) it.recipientId else it.senderId
         }.filterNot { it in blockedIds }.distinct()
-        val profiles = api.profilesByUserIds(s.accessToken, otherIds).associateBy { it.userId }
+        val profiles = api.profilesByUserIds(s.accessToken, otherIds)
+        cache.upsertMessages(rows)
+        cache.upsertProfiles(profiles)
+        val mergedRows = cache.loadInboxRows(s.userId).filterNot { it.id in hiddenIds() }
+        val profileMap = cache.loadProfiles().associateBy { it.userId }.toMutableMap()
+        ownProfile?.let { profileMap[it.userId] = it }
+        conversations = buildConversations(mergedRows, profileMap, s.userId)
+    }
+
+    private fun buildConversations(
+        rows: List<DbMessage>,
+        profiles: Map<String, Profile>,
+        me: String
+    ): List<Conversation> {
         val grouped = rows.groupBy {
-            if (it.senderId == s.userId) it.recipientId else it.senderId
+            if (it.senderId == me) it.recipientId else it.senderId
         }
-        conversations = grouped.mapNotNull { (otherId, threadRows) ->
+        return grouped.mapNotNull { (otherId, threadRows) ->
             if (otherId in blockedIds) return@mapNotNull null
             val profile = profiles[otherId] ?: return@mapNotNull null
             val latest = threadRows.maxByOrNull { it.createdAt.orEmpty() }
@@ -351,7 +434,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
                 lastMessage = decrypted,
                 lastAt = latest?.createdAt,
                 unreadCount = threadRows.count {
-                    it.senderId == otherId && it.recipientId == s.userId && it.readAt == null
+                    it.senderId == otherId && it.recipientId == me && it.readAt == null
                 }
             )
         }.sortedByDescending { it.lastAt.orEmpty() }
@@ -364,15 +447,26 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             if (c.userId in blockedIds) return@runCatching
             val freshContact = api.profileByUserId(s.accessToken, c.userId) ?: c
             contact = freshContact
-            val rows = api.fetchThread(s.accessToken, s.userId, freshContact.userId)
+            cache.upsertProfiles(listOf(freshContact))
+            var rows = api.fetchThread(s.accessToken, s.userId, freshContact.userId)
                 .filterNot { it.id in hiddenIds() }
             val unread = rows.filter {
                 it.recipientId == s.userId && it.readAt == null
-            }.map { it.id }
+            }.map { it.id }.toSet()
             if (unread.isNotEmpty()) {
-                runCatching { api.markRead(s.accessToken, s.userId, unread) }
+                runCatching { api.markRead(s.accessToken, s.userId, unread.toList()) }
+                val now = Instant.now().toString()
+                rows = rows.map { row ->
+                    if (row.id in unread) row.copy(
+                        deliveredAt = row.deliveredAt ?: now,
+                        readAt = now
+                    ) else row
+                }
             }
-            messages = rows.map { decryptRow(it, freshContact) }
+            cache.upsertMessages(rows)
+            messages = cache.loadThread(s.userId, freshContact.userId)
+                .filterNot { it.id in hiddenIds() }
+                .map { decryptRow(it, freshContact) }
         }.onFailure { status = friendlyError(it) }
     }
 
@@ -443,7 +537,6 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             )
             sendPayload(payload, "text", null)
             replyingTo = null
-            refreshMessages()
         }.onFailure { status = friendlyError(it) }
     }
 
@@ -481,7 +574,6 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             sendPayload(payload, "file", filePath, forcedId = id)
             replyingTo = null
             status = "Encrypted file sent"
-            refreshMessages()
         }.onFailure { status = friendlyError(it) }
         busy = false
     }
@@ -511,7 +603,22 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             filePath = filePath
         )
         message = message.copy(signature = CryptoEngine.b64(crypto.sign(signedBytes(message))))
-        api.sendMessage(s.accessToken, message)
+        val localMessage = message.copy(createdAt = Instant.now().toString())
+
+        // Optimistic local commit: the bubble appears before the network round-trip.
+        cache.upsertMessages(listOf(localMessage))
+        val optimistic = decryptRow(localMessage, c)
+        messages = (messages.filterNot { it.db.id == localMessage.id } + optimistic)
+            .sortedBy { it.db.createdAt.orEmpty() }
+
+        try {
+            // Keep server ordering authoritative: created_at is omitted and filled by Postgres.
+            api.sendMessage(s.accessToken, message)
+        } catch (error: Throwable) {
+            cache.deleteMessage(localMessage.id)
+            messages = messages.filterNot { it.db.id == localMessage.id }
+            throw error
+        }
     }
 
     private fun signedBytes(message: DbMessage): ByteArray = listOf(
@@ -550,6 +657,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             val s = ensureFreshSession()
             api.blockUser(s.accessToken, s.userId, c.userId)
             blockedIds = blockedIds + c.userId
+            cache.addBlockedId(c.userId)
             status = "@${c.handle} blocked"
             closeChat()
         }.onFailure { status = friendlyError(it) }
@@ -560,6 +668,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             val s = ensureFreshSession()
             api.unblockUser(s.accessToken, s.userId, profile.userId)
             blockedIds = blockedIds - profile.userId
+            cache.removeBlockedId(profile.userId)
             blockedProfiles = blockedProfiles.filterNot { it.userId == profile.userId }
             status = "@${profile.handle} unblocked"
         }.onFailure { status = friendlyError(it) }
@@ -567,6 +676,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun refreshBlockedInternal(s: Session) {
         blockedIds = api.fetchBlockedIds(s.accessToken, s.userId)
+        cache.replaceBlockedIds(blockedIds)
     }
 
     fun refreshBlockedProfiles() = viewModelScope.launch {
@@ -574,6 +684,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             val s = ensureFreshSession()
             refreshBlockedInternal(s)
             blockedProfiles = api.profilesByUserIds(s.accessToken, blockedIds)
+            cache.upsertProfiles(blockedProfiles)
         }.onFailure { status = friendlyError(it) }
     }
 

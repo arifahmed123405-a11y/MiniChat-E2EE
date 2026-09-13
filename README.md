@@ -1,4 +1,4 @@
-# MiniChat E2EE v1.0
+# MiniChat E2EE v1.1 Instant
 
 MiniChat is a compact native Android 1-to-1 messenger built with Kotlin + Jetpack Compose. Message/file contents are encrypted on the phone before they are uploaded.
 
@@ -20,6 +20,10 @@ MiniChat is a compact native Android 1-to-1 messenger built with Kotlin + Jetpac
 - Own/contact security fingerprints
 - Trust-on-first-use contact key pinning; changed keys are blocked until explicitly trusted
 - Automatic Supabase session refresh
+- App-private ciphertext cache for instant chat/inbox opening
+- Optimistic text sending: bubble appears before the network round-trip
+- Cache is wiped on logout or account switch; a new account never sees the previous account's local data
+- Per-account persistent device encryption identities (legacy v1 identity is preserved for the first upgraded account)
 - GitHub Actions APK build
 
 ## Cryptography
@@ -32,7 +36,7 @@ MiniChat is a compact native Android 1-to-1 messenger built with Kotlin + Jetpac
 
 The server stores ciphertext plus routing metadata needed to operate the service. It can see account IDs, who is talking to whom, timestamps, ciphertext sizes, delivery/read timestamps and encrypted blob paths. It cannot read message text, filenames, attachment contents or attachment keys.
 
-MiniChat v1 is **not** a Signal protocol implementation. It does not yet provide a Double Ratchet, forward secrecy per message, sealed-sender metadata hiding, multi-device key sync or encrypted cloud key backup.
+MiniChat v1.1 is **not** a Signal protocol implementation. It does not yet provide a Double Ratchet, forward secrecy per message, sealed-sender metadata hiding, multi-device key sync or encrypted cloud key backup.
 
 ## Backend
 
@@ -77,6 +81,12 @@ app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Every push to `main` runs `.github/workflows/android.yml` and uploads the APK as a GitHub Actions artifact.
+
+## Local cache and account isolation
+
+The SQLite cache lives only in app-private storage and stores server ciphertext plus public profiles — not decrypted message bodies. It is owned by exactly one active account. Logging out wipes cached messages, cached profiles, block state, local hidden-message state and temporary decrypted attachment files. Logging in as another account also forces a wipe before that account is activated.
+
+The cryptographic identity follows a different lifetime: it is persistent per account so logging out and back in does not make old ciphertext undecryptable. On upgrade from v1.0, the first account keeps the existing legacy Android Keystore identity; later accounts get separate scoped aliases.
 
 ## Single-device identity rule
 
