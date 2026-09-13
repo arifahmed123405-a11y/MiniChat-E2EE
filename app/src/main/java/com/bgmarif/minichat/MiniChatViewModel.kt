@@ -42,7 +42,20 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
     init {
         session?.let { s ->
             viewModelScope.launch {
-                runCatching { ownProfile = api.profileByUserId(s.accessToken, s.userId) }
+                runCatching {
+                    val existing = api.profileByUserId(s.accessToken, s.userId)
+                    if (existing != null) {
+                        ownProfile = existing
+                    } else {
+                        publishCurrentKeys(fallbackHandle(null, s.userId))
+                        status = "MiniChat profile created"
+                    }
+                }.onFailure {
+                    clearStoredSession()
+                    session = null
+                    ownProfile = null
+                    status = "Please sign in again"
+                }
                 changed()
             }
         }
@@ -60,6 +73,38 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             .putString("refresh", s.refreshToken)
             .putString("uid", s.userId)
             .apply()
+    }
+
+    private fun clearStoredSession() {
+        sessionPrefs.edit()
+            .remove("access")
+            .remove("refresh")
+            .remove("uid")
+            .apply()
+    }
+
+    private fun validHandle(value: String?): String? {
+        val clean = value?.trim()?.lowercase() ?: return null
+        return clean.takeIf { it.matches(Regex("[a-z0-9_]{3,24}")) }
+    }
+
+    private fun fallbackHandle(email: String?, userId: String): String {
+        var base = email
+            ?.substringBefore("@")
+            ?.lowercase()
+            ?.replace(Regex("[^a-z0-9_]"), "_")
+            ?.trim('_')
+            .orEmpty()
+
+        if (base.length < 3) base = "user"
+        base = base.take(15)
+
+        val suffix = userId
+            .filter { it.isLetterOrDigit() }
+            .take(6)
+            .lowercase()
+
+        return "${base}_${suffix}".take(24)
     }
 
     private fun setBusy(value: Boolean, text: String = status) {
@@ -81,14 +126,32 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
     fun login(email: String, password: String) = viewModelScope.launch {
         setBusy(true, "Signing in…")
         runCatching {
-            val s = api.login(email.trim(), password)
+            val cleanEmail = email.trim()
+            val s = api.login(cleanEmail, password)
             session = s
+
+            val existing = api.profileByUserId(s.accessToken, s.userId)
+            var handle = existing?.handle
+                ?: validHandle(sessionPrefs.getString("pending_handle", null))
+                ?: fallbackHandle(cleanEmail, s.userId)
+
+            if (existing == null) {
+                val taken = api.profileByHandle(s.accessToken, handle)
+                if (taken != null && taken.userId != s.userId) {
+                    handle = fallbackHandle(cleanEmail, s.userId)
+                }
+            }
+
+            publishCurrentKeys(handle)
             saveSession(s)
-            ownProfile = api.profileByUserId(s.accessToken, s.userId)
-                ?: error("This account has no MiniChat profile yet. Sign up in the app first.")
-            publishCurrentKeys(ownProfile!!.handle)
-            status = "Signed in"
-        }.onFailure { status = it.message ?: "Login failed" }
+            sessionPrefs.edit().remove("pending_handle").apply()
+            status = "Signed in as @$handle"
+        }.onFailure {
+            clearStoredSession()
+            session = null
+            ownProfile = null
+            status = it.message ?: "Login failed"
+        }
         busy = false
         changed()
     }
@@ -99,15 +162,31 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             status = "Handle: 3–24 chars, letters/numbers/_ only"
             changed(); return@launch
         }
+
+        val cleanEmail = email.trim()
+        sessionPrefs.edit().putString("pending_handle", cleanHandle).apply()
         setBusy(true, "Creating encrypted identity…")
+
         runCatching {
-            val s = api.signUp(email.trim(), password)
-            session = s
-            saveSession(s)
-            publishCurrentKeys(cleanHandle)
-            ownProfile = api.profileByUserId(s.accessToken, s.userId)
-            status = "Account ready"
-        }.onFailure { status = it.message ?: "Signup failed" }
+            val s = api.signUp(cleanEmail, password)
+
+            if (s == null) {
+                session = null
+                status = "Check your email to confirm the account, then tap Already have an account and sign in. If this email already belongs to EarnWall, just sign in with its password."
+            } else {
+                session = s
+                publishCurrentKeys(cleanHandle)
+                saveSession(s)
+                sessionPrefs.edit().remove("pending_handle").apply()
+                status = "Account ready as @$cleanHandle"
+            }
+        }.onFailure {
+            clearStoredSession()
+            session = null
+            ownProfile = null
+            status = it.message ?: "Signup failed"
+        }
+
         busy = false
         changed()
     }

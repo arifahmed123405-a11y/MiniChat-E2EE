@@ -42,7 +42,7 @@ class SupabaseApi(
         }
     }
 
-    suspend fun signUp(email: String, password: String): Session {
+    suspend fun signUp(email: String, password: String): Session? {
         val payload = buildJsonObject {
             put("email", email)
             put("password", password)
@@ -52,9 +52,10 @@ class SupabaseApi(
                 .post(payload.toRequestBody(jsonType)).build()
         )
         val auth = json.decodeFromString<AuthResponse>(body)
-        val token = auth.accessToken ?: error(
-            "Signup created, but no session was returned. For testing, confirm the email or disable Confirm Email in Supabase Auth."
-        )
+
+        // Hosted Supabase projects commonly require email confirmation.
+        // In that case signup succeeds but no access token/session is returned yet.
+        val token = auth.accessToken ?: return null
         val user = auth.user ?: error("Signup did not return a user")
         return Session(token, auth.refreshToken, user.id)
     }
