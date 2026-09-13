@@ -2,7 +2,6 @@
     <style name="Theme.MiniChat" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowLightNavigationBar">false</item>
         <item name="android:navigationBarColor">#080A0F</item>
         <item name="android:statusBarColor">#080A0F</item>
         <item name="android:windowActionModeOverlay">true</item>
