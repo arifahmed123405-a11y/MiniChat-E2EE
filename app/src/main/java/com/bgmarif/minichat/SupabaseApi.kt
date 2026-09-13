@@ -17,7 +17,7 @@ class SupabaseApi(
     private val anonKey: String
 ) {
     private val client = OkHttpClient()
-    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private val json = Json { ignoreUnknownKeys = true }
     private val jsonType = "application/json".toMediaType()
 
     private fun configured() {
@@ -75,7 +75,7 @@ class SupabaseApi(
     }
 
     suspend fun upsertProfile(token: String, profile: Profile) {
-        val url = "${baseUrl.trimEnd('/')}/rest/v1/profiles"
+        val url = "${baseUrl.trimEnd('/')}/rest/v1/minichat_profiles"
         execute(
             builder(url, token)
                 .header("Content-Type", "application/json")
@@ -86,7 +86,7 @@ class SupabaseApi(
     }
 
     suspend fun profileByUserId(token: String, userId: String): Profile? {
-        val url = "${baseUrl.trimEnd('/')}/rest/v1/profiles".toHttpUrl().newBuilder()
+        val url = "${baseUrl.trimEnd('/')}/rest/v1/minichat_profiles".toHttpUrl().newBuilder()
             .addQueryParameter("user_id", "eq.$userId")
             .addQueryParameter("select", "*")
             .build()
@@ -95,7 +95,7 @@ class SupabaseApi(
     }
 
     suspend fun profileByHandle(token: String, handle: String): Profile? {
-        val url = "${baseUrl.trimEnd('/')}/rest/v1/profiles".toHttpUrl().newBuilder()
+        val url = "${baseUrl.trimEnd('/')}/rest/v1/minichat_profiles".toHttpUrl().newBuilder()
             .addQueryParameter("handle", "eq.${handle.trim().lowercase()}")
             .addQueryParameter("select", "*")
             .build()
@@ -104,7 +104,7 @@ class SupabaseApi(
     }
 
     suspend fun sendMessage(token: String, message: DbMessage) {
-        val url = "${baseUrl.trimEnd('/')}/rest/v1/messages"
+        val url = "${baseUrl.trimEnd('/')}/rest/v1/minichat_messages"
         execute(
             builder(url, token)
                 .header("Content-Type", "application/json")
@@ -116,7 +116,7 @@ class SupabaseApi(
 
     suspend fun fetchThread(token: String, me: String, other: String): List<DbMessage> {
         val filter = "(and(sender_id.eq.$me,recipient_id.eq.$other),and(sender_id.eq.$other,recipient_id.eq.$me))"
-        val url = "${baseUrl.trimEnd('/')}/rest/v1/messages".toHttpUrl().newBuilder()
+        val url = "${baseUrl.trimEnd('/')}/rest/v1/minichat_messages".toHttpUrl().newBuilder()
             .addQueryParameter("or", filter)
             .addQueryParameter("select", "*")
             .addQueryParameter("order", "created_at.asc")
@@ -126,7 +126,7 @@ class SupabaseApi(
     }
 
     suspend fun uploadFile(token: String, path: String, ciphertext: ByteArray) {
-        val url = "${baseUrl.trimEnd('/')}/storage/v1/object/chat-files/$path"
+        val url = "${baseUrl.trimEnd('/')}/storage/v1/object/minichat-files/$path"
         execute(
             builder(url, token)
                 .header("Content-Type", "application/octet-stream")
@@ -137,7 +137,7 @@ class SupabaseApi(
     }
 
     suspend fun downloadFile(token: String, path: String): ByteArray = withContext(Dispatchers.IO) {
-        val url = "${baseUrl.trimEnd('/')}/storage/v1/object/authenticated/chat-files/$path"
+        val url = "${baseUrl.trimEnd('/')}/storage/v1/object/authenticated/minichat-files/$path"
         val req = builder(url, token).get().build()
         client.newCall(req).execute().use { response ->
             if (!response.isSuccessful) error("File download failed: HTTP ${response.code}")
