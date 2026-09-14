@@ -16,8 +16,8 @@ android {
         applicationId = "com.bgmarif.minichat"
         minSdk = 26
         targetSdk = 35
-        versionCode = 110
-        versionName = "1.1.0"
+        versionCode = 120
+        versionName = "1.2.0"
 
         buildConfigField("String", "SUPABASE_URL", "\"${propOrEnv("SUPABASE_URL")}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${propOrEnv("SUPABASE_ANON_KEY")}\"")

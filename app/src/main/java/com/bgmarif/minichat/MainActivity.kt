@@ -116,7 +116,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = AppColors) {
                 Surface(Modifier.fillMaxSize()) {
-                    MiniChatApp()
+                    MiniChatV12App()
                 }
             }
         }

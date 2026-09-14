@@ -37,6 +37,8 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var needsHandle by mutableStateOf(false)
         private set
+    var identityMismatch by mutableStateOf(false)
+        private set
     var contact by mutableStateOf<Profile?>(null)
         private set
     var messages by mutableStateOf<List<DecryptedMessage>>(emptyList())
@@ -86,10 +88,14 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
                 needsHandle = profile == null
                 if (profile != null) {
                     cache.upsertProfiles(listOf(profile))
-                    publishCurrentKeys(profile.handle, fresh)
-                    refreshBlockedInternal(fresh)
-                    refreshConversationsInternal(fresh)
-                    status = ""
+                    identityMismatch = !localIdentityMatches(profile)
+                    if (identityMismatch) {
+                        status = "This phone's encryption identity does not match the published account identity."
+                    } else {
+                        refreshBlockedInternal(fresh)
+                        refreshConversationsInternal(fresh)
+                        status = ""
+                    }
                 } else {
                     status = "Choose a MiniChat handle to finish setup"
                 }
@@ -114,6 +120,7 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             localPrefs.edit().clear().apply()
             runCatching {
                 File(getApplication<Application>().cacheDir, "decrypted").deleteRecursively()
+            File(getApplication<Application>().cacheDir, "camera").deleteRecursively()
             }
             if (!pendingHandle.isNullOrBlank()) {
                 localPrefs.edit().putString("pending_handle", pendingHandle).apply()
@@ -156,11 +163,13 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
         localPrefs.edit().clear().apply()
         runCatching {
             File(getApplication<Application>().cacheDir, "decrypted").deleteRecursively()
+            File(getApplication<Application>().cacheDir, "camera").deleteRecursively()
         }
         crypto.deactivate()
         session = null
         ownProfile = null
         needsHandle = false
+        identityMismatch = false
         contact = null
         messages = emptyList()
         conversations = emptyList()
@@ -230,11 +239,15 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
                 ownProfile = existing
                 cache.upsertProfiles(listOf(existing))
                 needsHandle = false
-                publishCurrentKeys(existing.handle)
+                identityMismatch = !localIdentityMatches(existing)
                 localPrefs.edit().remove("pending_handle").apply()
-                refreshBlockedInternal(loggedIn)
-                refreshConversationsInternal(loggedIn)
-                status = ""
+                if (identityMismatch) {
+                    status = "This phone's encryption identity does not match the published account identity."
+                } else {
+                    refreshBlockedInternal(loggedIn)
+                    refreshConversationsInternal(loggedIn)
+                    status = ""
+                }
             } else {
                 val pending = cleanHandle(localPrefs.getString("pending_handle", null).orEmpty())
                 if (pending != null && isHandleAvailable(loggedIn, pending)) {
@@ -295,6 +308,10 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun updateHandle(handle: String) = viewModelScope.launch {
+        if (identityMismatch) {
+            status = "Resolve the encryption identity before changing your handle"
+            return@launch
+        }
         val clean = cleanHandle(handle) ?: run {
             status = "Invalid handle"
             return@launch
@@ -305,6 +322,44 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
             if (!isHandleAvailable(s, clean)) error("@$clean is already taken")
             publishCurrentKeys(clean, s)
             status = "Handle updated to @$clean"
+        }.onFailure { status = friendlyError(it) }
+        busy = false
+    }
+
+    private fun localIdentityMatches(profile: Profile): Boolean {
+        val local = crypto.fingerprint(crypto.publicHpkeKeyset(), crypto.signingPublicKey())
+        val remote = crypto.fingerprint(profile.hpkePublicKeyset, profile.signingPublicKey)
+        return local == remote
+    }
+
+    fun localIdentityFingerprint(): String? = runCatching {
+        crypto.fingerprint(crypto.publicHpkeKeyset(), crypto.signingPublicKey())
+    }.getOrNull()
+
+    fun serverIdentityFingerprint(): String? = ownProfile?.let {
+        crypto.fingerprint(it.hpkePublicKeyset, it.signingPublicKey)
+    }
+
+    fun resetEncryptionIdentity() = viewModelScope.launch {
+        val existing = ownProfile ?: return@launch
+        busy = true
+        status = "Resetting encryption identity…"
+        runCatching {
+            val s = ensureFreshSession()
+            val replacement = Profile(
+                userId = s.userId,
+                handle = existing.handle,
+                hpkePublicKeyset = crypto.publicHpkeKeyset(),
+                signingPublicKey = crypto.signingPublicKey(),
+                updatedAt = Instant.now().toString()
+            )
+            api.upsertProfile(s.accessToken, replacement)
+            cache.upsertProfiles(listOf(replacement))
+            ownProfile = replacement
+            identityMismatch = false
+            refreshBlockedInternal(s)
+            refreshConversationsInternal(s)
+            status = "Encryption identity reset. Contacts will see a security-key change."
         }.onFailure { status = friendlyError(it) }
         busy = false
     }
@@ -366,6 +421,29 @@ class MiniChatViewModel(app: Application) : AndroidViewModel(app) {
         status = ""
         session?.userId?.let(::hydrateCachedState)
         refreshConversations()
+    }
+
+    fun deleteConversation(profile: Profile) {
+        val s = session ?: return
+        val cutoff = cache.loadThread(s.userId, profile.userId)
+            .maxByOrNull { it.createdAt.orEmpty() }
+            ?.createdAt
+            ?: Instant.now().toString()
+        cache.setThreadDeletedBefore(profile.userId, cutoff)
+        cache.deleteThread(s.userId, profile.userId)
+        conversations = conversations.filterNot { it.contact.userId == profile.userId }
+        if (contact?.userId == profile.userId) {
+            contact = null
+            messages = emptyList()
+            replyingTo = null
+        }
+        status = ""
+    }
+
+    fun deleteCurrentChat() {
+        val c = contact ?: return
+        deleteConversation(c)
+        session?.userId?.let(::hydrateCachedState)
     }
 
     fun setReply(message: DecryptedMessage?) {
